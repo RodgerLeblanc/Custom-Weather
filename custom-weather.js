@@ -4,9 +4,12 @@ var useConfig = true;
 var openWeatherMapApiKey = 'your_api_key_here';
 
 var request = require('request');
+var StorageProvider = require('vectorwatch-storageprovider');
 var VectorWatch = require('vectorwatch-sdk');
 var vectorWatch = new VectorWatch();
 var logger = vectorWatch.logger;
+var storageProvider = new StorageProvider();
+vectorWatch.setStorageProvider(storageProvider);
 
 vectorWatch.on('config', function(event, response) {
     // your stream was just dragged onto a watch face
@@ -49,14 +52,14 @@ vectorWatch.on('options', function(event, response) {
 
 vectorWatch.on('subscribe', function(event, response) {
     // your stream was added to a watch face
-    logger.info('on subscribe');
+    logger.info('on subscribe: ' + event.channelLabel);
 
     response.setValue('CellNinja');
 	response.send();
 
     try {
         // Yahoo servers sometimes returns 503, which breaks the subscription. Call webhook to avoid this.
-        callWebhook();
+        callWebhook(event.channelLabel);
     } catch(err) {
         logger.error('Error on subscribe: ' + err.message);
     }
@@ -64,7 +67,7 @@ vectorWatch.on('subscribe', function(event, response) {
 
 vectorWatch.on('unsubscribe', function(event, response) {
     // your stream was removed from a watch face
-    logger.info('on unsubscribe');
+    logger.info('on unsubscribe: ' + event.channelLabel);
     response.send();
 });
 
@@ -79,19 +82,55 @@ vectorWatch.on('schedule', function(records) {
 vectorWatch.on('webhook', function(event, response, records) {
     logger.info('on webhook');
     
-    records.forEach(function(record) {
-        getWeatherFromRecord(record);
-    });
+    var msg = event.getQuery()['msg'];
+    var channelLabel = event.getQuery()['channelLabel'];
+    if (!msg || !channelLabel) { return; }
     
+    var userSettings = {};
+    if (channelLabel !== 'ALL') {
+        try {
+            userSettings = storageProvider.userSettingsTable[channelLabel].userSettings;
+            logger.info('userSettings: ' + JSON.stringify(userSettings));
+        } catch(err) {
+            logger.error('Error getting user settings: ' + err.message);
+        }
+    }
+    
+    // Find the user who just installed the stream
+    var record = records.find(function(r) {
+        return r.channelLabel === channelLabel;
+    });
+
+    if (msg === 'onStreamInstall') {
+        // Only update the user who just installed the stream
+        getWeatherFromRecord(record);
+    }
+    else if (msg === 'checkSettings') {
+        if (channelLabel === 'ALL') {
+            logger.info('storageProvider.userSettingsTable: ' + JSON.stringify(storageProvider.userSettingsTable));
+            records.forEach(function(r) {
+                logger.info('record: ' + JSON.stringify(r));
+            });
+        } else {
+            logger.info('userSettings: ' + JSON.stringify(userSettings));
+        }
+    }
+    else if (msg === 'deleteWeatherData') {
+        userSettings.LastFetch = null;
+        userSettings.LastWeather = null;
+        logger.info('userSettings: ' + JSON.stringify(userSettings));
+    }
+
     response.setContentType('text/plain');
     response.statusCode = 200;
     response.setContent('OK');
     response.send();
 });
 
-function callWebhook() {
+function callWebhook(channelLabel) {
     return new Promise(function (resolve, reject) {
-        var url = 'https://endpoint.vector.watch/VectorCloud/rest/v1/stream/' + process.env.STREAM_UUID + '/webhook';
+        var url = 'https://endpoint.vector.watch/VectorCloud/rest/v1/stream/' + process.env.STREAM_UUID + '/webhook?msg=onStreamInstall&channelLabel=' + channelLabel;
+//        var url = 'https://endpoint.vector.watch/VectorCloud/rest/v1/stream/' + process.env.STREAM_UUID + '/webhook?msg=checkSettings&channelLabel=ALL';
         logger.info('url: ' + url);
 
         request(url, function (error, httpResponse, body) {
@@ -111,26 +150,36 @@ function callWebhook() {
 }
 
 function getWeatherFromRecord(record) {
-    var settings = getSettings(record.userSettings);
+    var userSettings = storageProvider.userSettingsTable[record.channelLabel].userSettings;
+    var settings = getSettings(userSettings);
+
+    var now = Date.now();
+    var oldDate = now - (1000 * 60 * 60 * 24 * 365);
+    var minWeatherFetchInterval = 1000 * 60 * 30; // 30 minutes
+
+    var lastFetch = settings.LastFetch ? settings.LastFetch : oldDate;
+    var difference = now - lastFetch;
+    logger.info('difference: ' + (difference / (1000 * 60)) + ' minutes');
+    logger.info('settings.LastFetch: ' + settings.LastFetch);
+    
+    //Reuse last weather if it's not too old
+    if (difference < minWeatherFetchInterval) {
+        logger.info('Using old weather data');
+        var lastWeather = settings.LastWeather ? settings.LastWeather : undefined;
+        pushUpdate(lastWeather, settings, record);
+        return;
+    }
+    
+    logger.info('Fetching new weather data');
     try {
         getWeather(settings).then(function(body) {
-            logger.info('body: ' + JSON.stringify(body));
-            
-            var streamText = getStreamText(settings, body);
-            logger.info('streamText: ' + streamText);
-                
-            record.pushUpdate(streamText);
+            pushUpdate(body, settings, record);
         }).catch(function(e) {
             logger.error('Error in on schedule first getWeather: ' + e);
             // Retry once again
             try {
                 getWeather(settings).then(function(body) {
-                    logger.info('body: ' + JSON.stringify(body));
-            
-                    var streamText = getStreamText(settings, body);
-                    logger.info('streamText: ' + streamText);
-                
-                    record.pushUpdate(streamText);
+                    pushUpdate(body, settings, record);
                 }).catch(function(e) {
                     logger.error('Error in on schedule second getWeather: ' + e);
                 });
@@ -187,9 +236,31 @@ function getWeather(settings) {
     });
 }
 
+function pushUpdate(body, settings, record) {
+    logger.info('pushUpdate body: ' + JSON.stringify(body));
+    
+    if (!body) {
+        return;
+    }
+    
+    var streamText = getStreamText(settings, body);
+    logger.info('streamText: ' + streamText);
+
+    // Save weather info
+    try {
+        var userSettings = storageProvider.userSettingsTable[record.channelLabel].userSettings;
+        userSettings['LastFetch'] = Date.now();
+        userSettings['LastWeather'] = body;
+    } catch(err) {
+        logger.error('Error setting new weather data to user settings: ' + err.message);
+    }
+
+    record.pushUpdate(streamText);
+}
+
 function getSettings(settings) {
     if (!useConfig || (settings.City === undefined) || (settings.Scale === undefined) || (settings.Provider === undefined)) {
-        settings = JSON.parse('{"City":{"name":"London, UK"},"Scale":{"name":"C"},"Provider":{"name":"OpenWeatherMap"}}');
+        settings = JSON.parse('{"City":{"name":"London, UK"},"Scale":{"name":"C"},"Provider":{"name":"OpenWeatherMap"},"LastFetch":null,"LastWeather":null}');
     }
     return settings;
 }
@@ -216,6 +287,17 @@ function getStreamText(settings, body) {
     
     return convertedIcon + temp + "°" + scale;
 }
+
+/*
+function logFunctionsAndProperties(object) {
+    var toReturn = '';
+    var members = Object.getOwnPropertyNames(object);
+    members.forEach(function(member) {
+        toReturn += (member + ' (' + typeof object[member] + ')\n');
+    });
+    return toReturn;
+}
+*/
 
 function vectorIconFromYahooIcon(code)  {
 	switch(parseInt(code)) {
