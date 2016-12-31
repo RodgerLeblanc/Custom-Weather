@@ -39,15 +39,6 @@ vectorWatch.on('options', function(event, response) {
     // dynamic options for a specific setting name was requested
     logger.info('on options');
     
-    switch(event.req.body.settingName) {
-        case 'City':
-            var searchTerm = event.getSearchTerm();
-    
-            response.addOption(searchTerm);
-            response.send();
-            break;
-    }
-    
     return response;
 });
 
