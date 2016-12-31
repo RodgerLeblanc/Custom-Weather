@@ -2,6 +2,7 @@
 
 var useConfig = true;
 var openWeatherMapApiKey = 'your_api_key_here';
+var maxWeatherRetries = 10;
 
 var request = require('request');
 var StorageProvider = require('vectorwatch-storageprovider');
@@ -54,14 +55,17 @@ vectorWatch.on('subscribe', function(event, response) {
     // your stream was added to a watch face
     logger.info('on subscribe: ' + event.channelLabel);
 
-    response.setValue('CellNinja');
-	response.send();
-
     try {
-        // Yahoo servers sometimes returns 503, which breaks the subscription. Call webhook to avoid this.
-        callWebhook(event.channelLabel);
+        var settings = getSettings(event.getUserSettings().settings);
+        settings['weatherRetries'] = 0;
+        getWeatherFromSubscribe(settings, response);
     } catch(err) {
         logger.error('Error on subscribe: ' + err.message);
+        response.setValue('Updating.');
+	    response.send();
+	    
+        // An error occured, call webhook to refresh stream.
+        callWebhook('onStreamInstall', event.channelLabel);
     }
 });
 
@@ -75,6 +79,13 @@ vectorWatch.on('schedule', function(records) {
     logger.info('on schedule');
 
     records.forEach(function(record) {
+        var userSettings = {};
+        try {
+            userSettings = storageProvider.userSettingsTable[record.channelLabel].userSettings;
+        } catch(err) {
+            logger.error('Error getting user settings: ' + err.message);
+        }
+        userSettings['weatherRetries'] = 0;
         getWeatherFromRecord(record);
     });
 });
@@ -103,6 +114,7 @@ vectorWatch.on('webhook', function(event, response, records) {
 
     if (msg === 'onStreamInstall') {
         // Only update the user who just installed the stream
+        userSettings['weatherRetries'] = 0;
         getWeatherFromRecord(record);
     }
     else if (msg === 'checkSettings') {
@@ -127,9 +139,9 @@ vectorWatch.on('webhook', function(event, response, records) {
     response.send();
 });
 
-function callWebhook(channelLabel) {
+function callWebhook(msg, channelLabel) {
     return new Promise(function (resolve, reject) {
-        var url = 'https://endpoint.vector.watch/VectorCloud/rest/v1/stream/' + process.env.STREAM_UUID + '/webhook?msg=onStreamInstall&channelLabel=' + channelLabel;
+        var url = 'https://endpoint.vector.watch/VectorCloud/rest/v1/stream/' + process.env.STREAM_UUID + '/webhook?msg=' + msg + '&channelLabel=' + channelLabel;
 //        var url = 'https://endpoint.vector.watch/VectorCloud/rest/v1/stream/' + process.env.STREAM_UUID + '/webhook?msg=checkSettings&channelLabel=ALL';
         logger.info('url: ' + url);
 
@@ -154,8 +166,8 @@ function getWeatherFromRecord(record) {
     var settings = getSettings(userSettings);
 
     var now = Date.now();
-    var oldDate = now - (1000 * 60 * 60 * 24 * 365);
     var minWeatherFetchInterval = 1000 * 60 * 30; // 30 minutes
+    var oldDate = now - (10 * minWeatherFetchInterval);
 
     var lastFetch = settings.LastFetch ? settings.LastFetch : oldDate;
     var difference = now - lastFetch;
@@ -173,22 +185,60 @@ function getWeatherFromRecord(record) {
     logger.info('Fetching new weather data');
     try {
         getWeather(settings).then(function(body) {
+            settings['weatherRetries'] = 0;
             pushUpdate(body, settings, record);
         }).catch(function(e) {
-            logger.error('Error in on schedule first getWeather: ' + e);
-            // Retry once again
-            try {
-                getWeather(settings).then(function(body) {
-                    pushUpdate(body, settings, record);
-                }).catch(function(e) {
-                    logger.error('Error in on schedule second getWeather: ' + e);
-                });
-            } catch(err) {
-                logger.error('Double error: ' + err.message);
+            var retries = settings.weatherRetries || 0;
+            settings['weatherRetries'] = ++retries;
+            if (retries < maxWeatherRetries) {
+                logger.error('Error in on getWeatherFromRecord (attempt ' + retries + '): ' + e);
+                getWeatherFromRecord(record);
+            }
+            else {
+                logger.error('Failed to retrieve weather after ' + settings.weatherRetries + ' attempts: ' + e);
             }
         });
     } catch(err) {
-        logger.error('on push - malformed user setting: ' + err.message);
+        logger.error('Double error: ' + err.message);
+        var retries = settings.weatherRetries || 0;
+        settings['weatherRetries'] = ++retries;
+        if (retries < maxWeatherRetries) {
+            getWeatherFromRecord(settings);
+        }
+    }
+}
+
+function getWeatherFromSubscribe(settings, response) {
+    logger.info('Fetching new weather data');
+    try {
+        getWeather(settings).then(function(body) {
+            body = getStreamText(settings, body);
+            settings['weatherRetries'] = 0;
+            response.setValue(body);
+            response.send();
+        }).catch(function(e) {
+            var retries = settings.weatherRetries || 0;
+            settings['weatherRetries'] = ++retries;
+            if (retries < maxWeatherRetries) {
+                logger.error('Error in on getWeatherFromSubscribe (attempt ' + retries + '): ' + e);
+                getWeatherFromSubscribe(settings, response);
+            }
+            else {
+                response.setValue('Updating..');
+                response.send();
+            }
+        });
+    } catch(err) {
+        logger.error('Double error: ' + err.message);
+        var retries = settings.weatherRetries || 0;
+        settings['weatherRetries'] = ++retries;
+        if (retries < maxWeatherRetries) {
+            getWeatherFromSubscribe(settings, response);
+        }
+        else {
+            response.setValue('Updating...');
+            response.send();
+        }
     }
 }
 
@@ -227,6 +277,7 @@ function getWeather(settings) {
             }
 
             try {
+                logger.info('body: ' + body);
                 body = JSON.parse(body);
                 resolve(body);
             } catch(err) {
@@ -260,7 +311,7 @@ function pushUpdate(body, settings, record) {
 
 function getSettings(settings) {
     if (!useConfig || (settings.City === undefined) || (settings.Scale === undefined) || (settings.Provider === undefined)) {
-        settings = JSON.parse('{"City":{"name":"London, UK"},"Scale":{"name":"C"},"Provider":{"name":"OpenWeatherMap"},"LastFetch":null,"LastWeather":null}');
+        settings = JSON.parse('{"City":{"name":"London, UK"},"Scale":{"name":"C"},"Provider":{"name":"Yahoo"},"LastFetch":null,"LastWeather":null}');
     }
     return settings;
 }
